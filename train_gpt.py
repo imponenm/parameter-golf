@@ -89,8 +89,9 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     # EMA: exponential moving average of model weights for better eval.
+    # Default start=-1 means "start when QAT starts" so EMA only averages QAT-adapted weights.
     ema_decay = float(os.environ.get("EMA_DECAY", 0.995))
-    ema_start_step = int(os.environ.get("EMA_START_STEP", 200))
+    ema_start_step = int(os.environ.get("EMA_START_STEP", -1))
 
     # Quantization-aware training: simulate low-bit weights during forward via STE.
     qat_bits = int(os.environ.get("QAT_BITS", 6))        # 0 = disabled
@@ -1115,6 +1116,10 @@ def main() -> None:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
+    ema_effective_start = args.ema_start_step
+    if ema_effective_start < 0 and args.qat_bits > 0:
+        ema_effective_start = int(args.qat_start_frac * args.iterations)
+
     step = 0
     while True:
         # Enable QAT after the warmup fraction of training
@@ -1125,7 +1130,10 @@ def main() -> None:
                     if isinstance(module, CastedLinear):
                         module._qat_bits = args.qat_bits
                 qat_active = True
+                # Reset EMA to current weights so it only averages QAT-adapted weights
+                ema_state = {name: tensor.detach().clone() for name, tensor in base_model.state_dict().items()}
                 log0(f"qat:enabled bits={args.qat_bits} at step {step}")
+                log0(f"ema:reset shadow weights at QAT start (step {step})")
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
@@ -1191,7 +1199,7 @@ def main() -> None:
         step += 1
 
         # EMA update
-        if step >= args.ema_start_step:
+        if step >= ema_effective_start:
             with torch.no_grad():
                 for name, param in base_model.state_dict().items():
                     ema_state[name].lerp_(param, 1.0 - args.ema_decay)
