@@ -645,6 +645,116 @@ class Block(nn.Module):
         return x
 
 
+class SemanticHierarchyCache(nn.Module):
+    """
+    Fixed lookup table providing semantic context vectors for each token,
+    built from token co-occurrence statistics in the training data.
+
+    Instead of learning hierarchical relationships (dog→animal, run→verb)
+    from transformer parameters, this table encodes them as a frozen prior.
+    The model only learns a single scalar gate controlling how much to trust it.
+
+    The table is populated *before* training via build_from_cooccurrence() so
+    the gate parameter receives gradient signal from step 0 onward.
+
+    Artifact cost (default config, vocab=1024, dim=512):
+      • Raw fp16  : 1024 × 512 × 2 B  ≈ 1 MB
+      • int8+zlib : ≈ 0.3–0.4 MB  (SVD vectors are smooth → compress well)
+    """
+
+    def __init__(self, vocab_size: int, model_dim: int):
+        super().__init__()
+        # Non-learnable lookup table: [vocab_size, model_dim] stored in fp16.
+        self.register_buffer("table", torch.zeros(vocab_size, model_dim, dtype=torch.float16))
+        # Single learned gate: starts at 0 (no effect), grows as training finds utility.
+        self.scale = nn.Parameter(torch.zeros(1))
+
+    @torch.no_grad()
+    def build_from_cooccurrence(
+        self, shard_pattern: str, vocab_size: int, model_dim: int, window: int = 5, max_shards: int = 4,
+    ) -> None:
+        """
+        Populate the table from token co-occurrence statistics in training data.
+
+        Steps:
+          1. Scan a few training shards, counting co-occurrences within a
+             fixed window to build a [V, V] matrix.
+          2. Apply PPMI (Positive Pointwise Mutual Information) weighting —
+             this turns raw counts into a measure of "does token A appear
+             near token B more than chance would predict?"
+          3. Truncated SVD to compress the sparse V×V PPMI matrix into dense
+             vectors of size model_dim.
+
+        The result is essentially GloVe-style vectors built directly from
+        the challenge data — genuine external structure the model doesn't
+        have to spend its limited parameters rediscovering.
+        """
+        shard_files = sorted(glob.glob(shard_pattern))[:max_shards]
+        if not shard_files:
+            return  # graceful no-op if data is missing
+
+        # --- Step 1: Co-occurrence counts ---
+        cooccur = np.zeros((vocab_size, vocab_size), dtype=np.float32)
+        for shard_path in shard_files:
+            tokens = load_data_shard(Path(shard_path)).numpy().astype(np.int32)
+            n = len(tokens)
+            for offset in range(1, window + 1):
+                left = tokens[:n - offset]
+                right = tokens[offset:]
+                # Symmetric: if A appears near B, B appears near A
+                np.add.at(cooccur, (left, right), 1.0)
+                np.add.at(cooccur, (right, left), 1.0)
+
+        # --- Step 2: PPMI weighting ---
+        total = cooccur.sum()
+        if total == 0:
+            return
+        row_sums = cooccur.sum(axis=1, keepdims=True)
+        col_sums = cooccur.sum(axis=0, keepdims=True)
+        # PMI = log(P(a,b) / (P(a)*P(b))) = log(count * total / (row*col))
+        denom = row_sums * col_sums
+        # Avoid log(0): only compute where both co-occur count and denom > 0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pmi = np.where(
+                (cooccur > 0) & (denom > 0),
+                np.log(cooccur * total / denom),
+                0.0,
+            )
+        ppmi = np.maximum(pmi, 0.0).astype(np.float32)  # positive part only
+
+        # --- Step 3: Truncated SVD → dense vectors ---
+        rank = min(model_dim, vocab_size - 1)
+        ppmi_t = torch.from_numpy(ppmi)
+        U, S, _ = torch.svd_lowrank(ppmi_t, q=rank)
+        # Weight by sqrt(S) — standard practice (GloVe-like)
+        vectors = (U * S.sqrt().unsqueeze(0)).numpy()  # [V, rank]
+
+        # Pad to model_dim if rank < model_dim (possible for tiny vocabs)
+        if vectors.shape[1] < model_dim:
+            pad = np.zeros((vocab_size, model_dim - vectors.shape[1]), dtype=np.float32)
+            vectors = np.concatenate([vectors, pad], axis=1)
+
+        # Normalise to unit std so scale parameter starts in a sensible range
+        std = vectors.std()
+        if std > 1e-6:
+            vectors = vectors / std
+
+        self.table.copy_(torch.from_numpy(vectors).to(dtype=torch.float16))
+
+    def forward(self, x: Tensor, input_ids: Tensor) -> Tensor:
+        """
+        Intercept embedding output and add scaled semantic context.
+
+        Args:
+            x         : token embeddings  [B, T, model_dim]
+            input_ids : token indices     [B, T]
+        Returns:
+            enriched embeddings           [B, T, model_dim]
+        """
+        ctx = self.table[input_ids].to(dtype=x.dtype)  # [B, T, model_dim]
+        return x + self.scale * ctx
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -667,6 +777,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.sem_cache = SemanticHierarchyCache(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -699,6 +810,7 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        x = self.sem_cache(x, input_ids)  # add semantic hierarchy context
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -861,6 +973,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    scalar_params.append(base_model.sem_cache.scale)  # gate for semantic cache
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -910,8 +1023,16 @@ def main() -> None:
     log0(f"seed:{args.seed}")
 
     # -----------------------------
-    # DATA LOADER & MODEL WARMUP
+    # SEMANTIC CACHE + DATA LOADER & MODEL WARMUP
     # -----------------------------
+
+    # Build the semantic hierarchy cache from token co-occurrence in training data.
+    # Runs on CPU before training starts (< 30s for 4 shards at vocab=1024).
+    t_cache = time.perf_counter()
+    base_model.sem_cache.build_from_cooccurrence(
+        args.train_files, args.vocab_size, args.model_dim, window=5, max_shards=4,
+    )
+    log0(f"sem_cache:built from cooccurrence in {1000*(time.perf_counter()-t_cache):.0f}ms")
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
