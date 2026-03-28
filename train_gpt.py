@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
-import zlib
+import zstandard as zstd
 from pathlib import Path
 
 import numpy as np
@@ -53,7 +53,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -87,6 +87,10 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # EMA: exponential moving average of model weights for better eval.
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.995))
+    ema_start_step = int(os.environ.get("EMA_START_STEP", 200))
 
     # Quantization-aware training: simulate low-bit weights during forward via STE.
     qat_bits = int(os.environ.get("QAT_BITS", 6))        # 0 = disabled
@@ -317,7 +321,7 @@ def eval_val(
 # -----------------------------
 #
 # It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
+# Instead, we get approximately the same model (with a small hit) by quantizing the model to int6 & zstd compressing.
 # We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
@@ -1097,6 +1101,11 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
+    # EMA SHADOW WEIGHTS
+    # -----------------------------
+    ema_state = {name: tensor.detach().clone() for name, tensor in base_model.state_dict().items()}
+
+    # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
 
@@ -1180,6 +1189,12 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+
+        # EMA update
+        if step >= args.ema_start_step:
+            with torch.no_grad():
+                for name, param in base_model.state_dict().items():
+                    ema_state[name].lerp_(param, 1.0 - args.ema_decay)
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1206,10 +1221,16 @@ def main() -> None:
     )
 
     # -----------------------------
+    # SWAP IN EMA WEIGHTS
+    # -----------------------------
+    log0("ema:loading shadow weights for eval/serialization")
+    base_model.load_state_dict(ema_state, strict=True)
+
+    # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
+    # the compressed int6+zstd artifact and validate the round-tripped weights.
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1223,25 +1244,25 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = zstd.ZstdCompressor(level=22).compress(quant_raw)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open("final_model.int6.zst", "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize("final_model.int6.zst")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model int6+zstd: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int6+zstd: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open("final_model.int6.zst", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(zstd.ZstdDecompressor().decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
@@ -1259,10 +1280,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int6_zstd_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int6_zstd_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
