@@ -88,6 +88,10 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Quantization-aware training: simulate low-bit weights during forward via STE.
+    qat_bits = int(os.environ.get("QAT_BITS", 6))        # 0 = disabled
+    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.15))  # fraction of training before enabling
+
     # Semantic embedding init: mix PPMI-SVD vectors into tok_emb before training.
     # 0.0 = disabled (pure random init), >0 = blend in co-occurrence structure.
     sem_embed_alpha = float(os.environ.get("SEM_EMBED_ALPHA", 0.005))
@@ -349,7 +353,11 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
+EXPORT_QUANT_BITS = int(os.environ.get("EXPORT_QUANT_BITS", 6))
+EXPORT_QMAX = (1 << (EXPORT_QUANT_BITS - 1)) - 1  # 31 for 6-bit, 127 for 8-bit
+
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+    qmax = EXPORT_QMAX
     t32 = t.float()
     if t32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
@@ -360,14 +368,14 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        scale = (clip_abs / qmax).clamp_min(1.0 / qmax)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / qmax if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -qmax, qmax).to(torch.int8).contiguous()
     return q, scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
@@ -537,11 +545,28 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+def fake_quantize_ste(t: Tensor, bits: int) -> Tensor:
+    """Simulate low-bit quantization with straight-through estimator.
+    Forward rounds to the quantized grid; backward passes gradients through unchanged."""
+    qmax = (1 << (bits - 1)) - 1  # 31 for 6-bit
+    if t.ndim == 2:
+        scale = t.detach().abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / qmax
+    else:
+        scale = t.detach().abs().max().clamp(min=1e-8) / qmax
+    t_q = (t / scale).round().clamp(-qmax, qmax) * scale
+    return t + (t_q - t).detach()
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    _qat_bits: int = 0  # 0 = disabled; set to e.g. 6 to enable fake quantization
+
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight.to(x.dtype)
+        if self._qat_bits > 0:
+            w = fake_quantize_ste(w, self._qat_bits)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1077,11 +1102,21 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    qat_active = False
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     step = 0
     while True:
+        # Enable QAT after the warmup fraction of training
+        if args.qat_bits > 0 and not qat_active:
+            qat_start_step = int(args.qat_start_frac * args.iterations)
+            if step >= qat_start_step:
+                for module in base_model.modules():
+                    if isinstance(module, CastedLinear):
+                        module._qat_bits = args.qat_bits
+                qat_active = True
+                log0(f"qat:enabled bits={args.qat_bits} at step {step}")
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
