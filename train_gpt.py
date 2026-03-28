@@ -89,8 +89,9 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     # EMA: exponential moving average of model weights for better eval.
+    # Disabled by default (0.0). Set >0 to enable.
     # Default start=-1 means "start when QAT starts" so EMA only averages QAT-adapted weights.
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.995))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
     ema_start_step = int(os.environ.get("EMA_START_STEP", -1))
 
     # Quantization-aware training: simulate low-bit weights during forward via STE.
@@ -100,6 +101,7 @@ class Hyperparameters:
     # Semantic embedding init: mix PPMI-SVD vectors into tok_emb before training.
     # 0.0 = disabled (pure random init), >0 = blend in co-occurrence structure.
     sem_embed_alpha = float(os.environ.get("SEM_EMBED_ALPHA", 0.005))
+    sem_embed_window = int(os.environ.get("SEM_EMBED_WINDOW", 5))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1043,7 +1045,7 @@ def main() -> None:
     if args.sem_embed_alpha > 0:
         t_sem = time.perf_counter()
         svd_vecs = build_ppmi_svd_vectors(
-            args.train_files, args.vocab_size, args.model_dim, window=5, max_shards=4,
+            args.train_files, args.vocab_size, args.model_dim, window=args.sem_embed_window, max_shards=4,
         )
         if svd_vecs is not None:
             with torch.no_grad():
@@ -1104,7 +1106,8 @@ def main() -> None:
     # -----------------------------
     # EMA SHADOW WEIGHTS
     # -----------------------------
-    ema_state = {name: tensor.detach().clone() for name, tensor in base_model.state_dict().items()}
+    ema_enabled = args.ema_decay > 0
+    ema_state = {name: tensor.detach().clone() for name, tensor in base_model.state_dict().items()} if ema_enabled else None
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1131,7 +1134,8 @@ def main() -> None:
                         module._qat_bits = args.qat_bits
                 qat_active = True
                 # Reset EMA to current weights so it only averages QAT-adapted weights
-                ema_state = {name: tensor.detach().clone() for name, tensor in base_model.state_dict().items()}
+                if ema_enabled:
+                    ema_state = {name: tensor.detach().clone() for name, tensor in base_model.state_dict().items()}
                 log0(f"qat:enabled bits={args.qat_bits} at step {step}")
                 log0(f"ema:reset shadow weights at QAT start (step {step})")
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
@@ -1199,7 +1203,7 @@ def main() -> None:
         step += 1
 
         # EMA update
-        if step >= ema_effective_start:
+        if ema_enabled and step >= ema_effective_start:
             with torch.no_grad():
                 for name, param in base_model.state_dict().items():
                     ema_state[name].lerp_(param, 1.0 - args.ema_decay)
@@ -1231,8 +1235,11 @@ def main() -> None:
     # -----------------------------
     # SWAP IN EMA WEIGHTS
     # -----------------------------
-    log0("ema:loading shadow weights for eval/serialization")
-    base_model.load_state_dict(ema_state, strict=True)
+    if ema_enabled and ema_state is not None:
+        log0("ema:loading shadow weights for eval/serialization")
+        base_model.load_state_dict(ema_state, strict=True)
+    else:
+        log0("ema:disabled, using live weights for eval/serialization")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
