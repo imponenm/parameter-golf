@@ -49,6 +49,7 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))  # 0 = no overlap; e.g. 64 for sliding window eval
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -235,40 +236,63 @@ def eval_val(
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    #
+    # When eval_stride < seq_len, uses sliding window evaluation: each window
+    # of seq_len tokens overlaps with the previous by (seq_len - stride) tokens.
+    # Only the last `stride` tokens per window are scored, giving each scored
+    # token nearly full seq_len context. Context-only positions are masked with
+    # ignore_index=-100 so the model forward() needs no changes.
+    seq_len = args.train_seq_len
+    stride = min(args.eval_stride, seq_len) if args.eval_stride > 0 else seq_len
+
+    # Build (possibly overlapping) windows: (num_windows, seq_len + 1)
+    all_windows = val_tokens.unfold(0, seq_len + 1, stride)
+    num_windows = all_windows.size(0)
+
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
-        )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
+    local_batch_seqs = max(1, local_batch_tokens // seq_len)
+    win_start = (num_windows * rank) // world_size
+    win_end = (num_windows * (rank + 1)) // world_size
+
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
+        for batch_begin in range(win_start, win_end, local_batch_seqs):
+            batch_end = min(batch_begin + local_batch_seqs, win_end)
+            batch = all_windows[batch_begin:batch_end].to(
+                device=device, dtype=torch.int64, non_blocking=True,
+            )
+            x = batch[:, :-1]
+            y = batch[:, 1:]
+            bsz = x.size(0)
+
+            # Score mask: last `stride` tokens per window; first window scores all
+            score_mask = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device)
+            score_mask[:, seq_len - stride :] = True
+            if batch_begin == 0:
+                score_mask[0, :] = True
+
+            # Mask out context-only positions so cross_entropy ignores them
+            y_masked = y.clone()
+            y_masked[~score_mask] = -100
+
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
-            batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
-            val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
+                batch_loss = model(x, y_masked).detach()
+
+            scored_count = float(score_mask.sum().item())
+            val_loss_sum += batch_loss.to(torch.float64) * scored_count
+            val_token_count += scored_count
+
+            # Byte counting for scored positions only
+            prev_flat = x.reshape(-1)
+            tgt_flat = y.reshape(-1)
+            mask_flat = score_mask.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_flat].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_flat] & ~is_boundary_token_lut[prev_flat]).to(dtype=torch.int16)
+            val_byte_count += (token_bytes.to(torch.float64) * mask_flat.to(torch.float64)).sum()
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
